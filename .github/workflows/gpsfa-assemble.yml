@@ -1,0 +1,78 @@
+name: GPSFA Assemble IPA
+
+on:
+  repository_dispatch:
+    types: [gpsfa_assemble]
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RELEASE_ID: ${{ github.event.client_payload.release_id }}
+      FINAL_NAME: ${{ github.event.client_payload.final_name }}
+      PART_PREFIX: ${{ github.event.client_payload.part_prefix }}
+      PART_COUNT: ${{ github.event.client_payload.part_count }}
+      EXPECTED_SIZE: ${{ github.event.client_payload.expected_size }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$PART_COUNT" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]
+          (( PART_COUNT >= 1 && PART_COUNT <= 512 ))
+          [[ "$FINAL_NAME" =~ ^[A-Za-z0-9._-]+\.ipa$ ]]
+          [[ "$PART_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]]
+      - name: Download parts and build IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          assets="$workdir/assets.jsonl"
+          : > "$assets"
+          page=1
+          while true; do
+            page_json="$(gh api "repos/$REPO/releases/$RELEASE_ID/assets?per_page=100&page=$page")"
+            count="$(jq length <<<"$page_json")"
+            jq -c ".[]" <<<"$page_json" >> "$assets"
+            (( count < 100 )) && break
+            page=$((page + 1))
+          done
+          part_ids="$workdir/part_ids.txt"
+          : > "$part_ids"
+          for ((i=0; i<PART_COUNT; i++)); do
+            printf -v suffix "%04d" "$i"
+            part_name="${PART_PREFIX}${suffix}.bin"
+            asset_id="$(jq -r --arg n "$part_name" "select(.name == \$n) | .id" "$assets" | head -n1)"
+            [[ -n "$asset_id" && "$asset_id" != "null" ]] || { echo "Missing part: $part_name"; exit 1; }
+            echo "$asset_id" >> "$part_ids"
+            curl --fail --silent --show-error --location \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
+              -o "$workdir/part-$suffix.bin"
+          done
+          cat "$workdir"/part-*.bin > "$workdir/$FINAL_NAME"
+          actual_size="$(stat -c%s "$workdir/$FINAL_NAME")"
+          [[ "$actual_size" == "$EXPECTED_SIZE" ]] || { echo "Size mismatch: $actual_size != $EXPECTED_SIZE"; exit 1; }
+          curl --fail --silent --show-error --location \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$workdir/$FINAL_NAME" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$FINAL_NAME" \
+            > "$workdir/final.json"
+          jq -e ".browser_download_url and .id" "$workdir/final.json" >/dev/null
+          while IFS= read -r asset_id; do
+            gh api --method DELETE "repos/$REPO/releases/assets/$asset_id" >/dev/null || true
+          done < "$part_ids"
